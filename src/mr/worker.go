@@ -1,10 +1,14 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,41 +28,86 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(
+	mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string,
+) {
+	rpcArgs := &RequestForTaskArgs{
+		// use -1 to indicate the first run
+		CompletedTaskId:   -1,
+		CompletedTaskType: TaskTypeMap,
+	}
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
+	for {
+		reply := requestForTask(rpcArgs)
+		if mapTask := reply.Map; mapTask != nil {
+			doMap(mapTask, mapf)
+			rpcArgs.CompletedTaskId = mapTask.Id
+			rpcArgs.CompletedTaskType = TaskTypeMap
+		} else if reduceTask := reply.Reduce; reduceTask != nil {
+			// TODO
+			//doReduce(reduceTask, reducef)
+			//rpcArgs.CompletedTaskId = reduceTask.Id
+			//rpcArgs.CompletedTaskType = TaskTypeReduce
+		} else {
+			// TODO: is this request to terminate?
+			panic("received invalid reply from master")
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func requestForTask(args *RequestForTaskArgs) *RequestForTaskReply {
+	reply := RequestForTaskReply{}
+	call("Master.RequestForTask", args, &reply)
+	return &reply
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+func doMap(task *MapTask, mapf func(string, string) []KeyValue) {
+	fmt.Printf("Performing map id=%v inputFilename=%v\n", task.Id, task.InputFile)
 
-	// fill in the argument(s).
-	args.X = 99
+	// Produce the intermediate kv pairs
+	inputFile, err := os.Open(task.InputFile)
+	if err != nil {
+		log.Fatalf("cannot open %v", task.InputFile)
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	content, err := ioutil.ReadAll(inputFile)
+	if err != nil {
+		log.Fatalf("cannot read %v", task.InputFile)
+	}
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+	inputFile.Close()
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	intermediateKv := mapf(task.InputFile, string(content))
+
+	// write the results to intermediate files
+	outputEncoders := make([]*json.Encoder, task.NReduce)
+	for _, kv := range intermediateKv {
+		partition := ihash(kv.Key) % task.NReduce
+
+		// TODO: use temp files?
+
+		// lazily create files for each partition
+		if outputEncoders[partition] == nil {
+			file, err := os.Create(intermediateFilename(task.Id, partition))
+			if err != nil {
+				log.Fatalf("failed to create intermediate file %v\n", err)
+			}
+			outputEncoders[partition] = json.NewEncoder(file)
+		}
+
+		err = outputEncoders[partition].Encode(&kv)
+		if err != nil {
+			log.Fatalf("failed to encode %v\n", err)
+		}
+	}
+}
+
+func intermediateFilename(mapId int, reduceId int) string {
+	return fmt.Sprintf("mr-%d-%d", mapId, reduceId)
 }
 
 //
