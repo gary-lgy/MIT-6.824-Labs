@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 type MapTask struct {
@@ -49,9 +50,9 @@ type Master struct {
 	sync.Mutex
 }
 
-func (m *Master) processCompletedTask(id int, taskType TaskType) {
+func (m *Master) processCompletedTask(id int, taskType TaskType, workerId string) {
 	if taskType == TaskTypeMap {
-		log.Printf("Worker reported map task %v complete\n", id)
+		log.Printf("Worker %v reported map task %v complete\n", workerId, id)
 
 		if _, alreadyCompleted := m.completedMapTasks[id]; alreadyCompleted {
 			log.Printf("Map task %v already completed. Re-execution?\n", id)
@@ -73,7 +74,7 @@ func (m *Master) processCompletedTask(id int, taskType TaskType) {
 			}
 		}
 	} else if taskType == TaskTypeReduce {
-		log.Printf("Worker reported reduce task %v complete\n", id)
+		log.Printf("Worker %v reported reduce task %v complete\n", workerId, id)
 
 		if _, alreadyCompleted := m.completedReduceTasks[id]; alreadyCompleted {
 			log.Printf("Reduce task %v already completed. Re-execution?\n", id)
@@ -82,7 +83,7 @@ func (m *Master) processCompletedTask(id int, taskType TaskType) {
 			log.Printf("Reduce task %v completed normally\n", id)
 		}
 	} else {
-		panic("received invalid task type from worker")
+		panic("received invalid task type from worker " + workerId)
 	}
 }
 
@@ -104,13 +105,35 @@ func (m *Master) popRunnableReduceTask() *ReduceTask {
 	return task
 }
 
+// If the task is not done after 10 seconds, assume the worker has died
+func (m *Master) prepareForWorkerFailure(taskId int, taskType TaskType, workerId string) {
+	time.Sleep(10 * time.Second)
+
+	m.Lock()
+	defer m.Unlock()
+
+	if taskType == TaskTypeMap {
+		if _, ok := m.completedMapTasks[taskId]; !ok {
+			m.runnableMapTaskQueue = append(m.runnableMapTaskQueue, taskId)
+			log.Printf("Worker %v did not complete map task %d within 10 seconds. Retry.\n", workerId, taskId)
+			m.hasTask.Signal()
+		}
+	} else if taskType == TaskTypeReduce {
+		if _, ok := m.completedReduceTasks[taskId]; !ok {
+			m.runnableReduceTaskQueue = append(m.runnableReduceTaskQueue, taskId)
+			log.Printf("Worker %v did not complete reduce task %d within 10 seconds. Retry.\n", workerId, taskId)
+			m.hasTask.Signal()
+		}
+	}
+}
+
 func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *RequestForTaskReply) error {
 	m.Lock()
 	defer m.Unlock()
 
 	// If the worker has completed a task, mark it as completed
 	if completedTask != nil && completedTask.CompletedTaskId >= 0 {
-		m.processCompletedTask(completedTask.CompletedTaskId, completedTask.CompletedTaskType)
+		m.processCompletedTask(completedTask.CompletedTaskId, completedTask.CompletedTaskType, completedTask.WorkerId)
 	}
 
 	// Try to give the worker another task
@@ -121,15 +144,16 @@ func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *Reques
 			return nil
 		}
 
-		// TODO: anticipate worker failure, re-add the task into runnable queue and signal cv
 		if mapTask := m.popRunnableMapTask(); mapTask != nil {
 			reply.Map = mapTask
-			log.Printf("Assigned map task %v to worker\n", mapTask.Id)
+			log.Printf("Assigned map task %v to worker %v\n", mapTask.Id, completedTask.WorkerId)
+			go m.prepareForWorkerFailure(mapTask.Id, TaskTypeMap, completedTask.WorkerId)
 			return nil
 		}
 		if reduceTask := m.popRunnableReduceTask(); reduceTask != nil {
 			reply.Reduce = reduceTask
-			log.Printf("Assigned reduce task %v to worker\n", reduceTask.Id)
+			log.Printf("Assigned reduce task %v to worker %v\n", reduceTask.Id, completedTask.WorkerId)
+			go m.prepareForWorkerFailure(reduceTask.Id, TaskTypeReduce, completedTask.WorkerId)
 			return nil
 		}
 
@@ -137,6 +161,7 @@ func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *Reques
 		// We are either waiting for all map tasks to finish before starting the reduce phase
 		// or waiting for dispatched reduce tasks to finish.
 		// In either case, we wait until we are clear what to do.
+		log.Printf("No runnable task available for worker %v\n", completedTask.WorkerId)
 		m.hasTask.Wait()
 	}
 }
@@ -181,6 +206,8 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
+	log.SetPrefix("[Master] ")
+
 	nMap := len(files)
 
 	mapTasks := make([]*MapTask, 0, nMap)

@@ -21,6 +21,7 @@ const (
 type RequestForTaskArgs struct {
 	CompletedTaskId   int
 	CompletedTaskType TaskType
+	WorkerId string
 }
 
 type RequestForTaskReply struct {

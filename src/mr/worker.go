@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -36,6 +37,13 @@ func ihash(key string) int {
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
+func getWorkerId() string {
+	b := make([]byte, 3)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%X", b)
+}
 
 //
 // main/mrworker.go calls this function.
@@ -44,14 +52,21 @@ func Worker(
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
+	workerId := getWorkerId()
+	log.SetPrefix("[Worker " + workerId + "] ")
 	rpcArgs := &RequestForTaskArgs{
-		// use -1 to indicate the first run
 		CompletedTaskId:   -1,
 		CompletedTaskType: TaskTypeMap,
+		WorkerId: workerId,
 	}
 
 	for {
 		reply := requestForTask(rpcArgs)
+		if reply == nil {
+			// master terminated
+			log.Printf("Master terminated\n")
+			break
+		}
 		if mapTask := reply.Map; mapTask != nil {
 			doMap(mapTask, mapf)
 			rpcArgs.CompletedTaskId = mapTask.Id
@@ -70,7 +85,9 @@ func Worker(
 
 func requestForTask(args *RequestForTaskArgs) *RequestForTaskReply {
 	reply := RequestForTaskReply{}
-	call("Master.RequestForTask", args, &reply)
+	if !call("Master.RequestForTask", args, &reply) {
+		return nil
+	}
 	return &reply
 }
 
@@ -96,25 +113,33 @@ func doMap(task *MapTask, mapf func(string, string) []KeyValue) {
 
 	intermediateKv := mapf(task.InputFile, string(content))
 
-	// write the results to intermediate files
+	// Create an encoder for each output file
+	outputFiles := make([]*os.File, task.NReduce)
 	outputEncoders := make([]*json.Encoder, task.NReduce)
+	for i := 0; i < task.NReduce; i++ {
+		file, err := ioutil.TempFile("", intermediateFilename(task.Id, i))
+		if err != nil {
+			log.Fatalf("failed to create intermediate file %v\n", err)
+		}
+		outputFiles[i] = file
+		outputEncoders[i] = json.NewEncoder(file)
+	}
+
+	// write the results to intermediate files
 	for _, kv := range intermediateKv {
 		partition := ihash(kv.Key) % task.NReduce
-
-		// TODO: use temp files?
-
-		// lazily create files for each partition
-		if outputEncoders[partition] == nil {
-			file, err := os.Create(intermediateFilename(task.Id, partition))
-			if err != nil {
-				log.Fatalf("failed to create intermediate file %v\n", err)
-			}
-			outputEncoders[partition] = json.NewEncoder(file)
-		}
-
 		err = outputEncoders[partition].Encode(&kv)
 		if err != nil {
 			log.Fatalf("failed to encode %v\n", err)
+		}
+	}
+
+	// rename the temp files
+	for i, outputFile := range outputFiles {
+		outputFile.Close()
+		err = os.Rename(outputFile.Name(), intermediateFilename(task.Id, i))
+		if err != nil {
+			log.Fatalf("failed to rename temp output file of map: %v\n", err)
 		}
 	}
 }
@@ -194,6 +219,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	log.Printf("rpc error: %v\n", err)
 	return false
 }
