@@ -45,6 +45,7 @@ type Master struct {
 	completedMapTasks    map[int]struct{}
 	completedReduceTasks map[int]struct{}
 
+	hasTask *sync.Cond
 	sync.Mutex
 }
 
@@ -61,8 +62,11 @@ func (m *Master) processCompletedTask(id int, taskType TaskType) {
 
 		if len(m.completedMapTasks) == len(m.mapTasks) {
 			log.Printf("===============================================\n")
-			log.Printf("All map tasks completed, can start reduce phase\n")
+			log.Printf("All map tasks completed, start reduce phase\n")
 			log.Printf("===============================================\n")
+
+			// Tell blocked workers to start working on reduce tasks
+			m.hasTask.Broadcast()
 
 			for i, _ := range m.reduceTasks {
 				m.runnableReduceTaskQueue = append(m.runnableReduceTaskQueue, i)
@@ -82,6 +86,24 @@ func (m *Master) processCompletedTask(id int, taskType TaskType) {
 	}
 }
 
+func (m *Master) popRunnableMapTask() *MapTask {
+	if len(m.runnableMapTaskQueue) <= 0 {
+		return nil
+	}
+	task := m.mapTasks[m.runnableMapTaskQueue[0]]
+	m.runnableMapTaskQueue = m.runnableMapTaskQueue[1:]
+	return task
+}
+
+func (m *Master) popRunnableReduceTask() *ReduceTask {
+	if len(m.runnableReduceTaskQueue) <= 0 {
+		return nil
+	}
+	task := m.reduceTasks[m.runnableReduceTaskQueue[0]]
+	m.runnableReduceTaskQueue = m.runnableReduceTaskQueue[1:]
+	return task
+}
+
 func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *RequestForTaskReply) error {
 	m.Lock()
 	defer m.Unlock()
@@ -91,39 +113,32 @@ func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *Reques
 		m.processCompletedTask(completedTask.CompletedTaskId, completedTask.CompletedTaskType)
 	}
 
-	// Give the worker another task
+	// Try to give the worker another task
+	for {
+		if m.done() {
+			// tell all workers to terminate
+			m.hasTask.Broadcast()
+			return nil
+		}
 
-	if len(m.runnableMapTaskQueue) > 0 {
-		// map task available, give map task
-		task := m.mapTasks[m.runnableMapTaskQueue[0]]
-		m.runnableMapTaskQueue = m.runnableMapTaskQueue[1:]
-		reply.Map = task
-		log.Printf("Assigned map task %v to worker\n", task.Id)
-		return nil
+		// TODO: anticipate worker failure, re-add the task into runnable queue and signal cv
+		if mapTask := m.popRunnableMapTask(); mapTask != nil {
+			reply.Map = mapTask
+			log.Printf("Assigned map task %v to worker\n", mapTask.Id)
+			return nil
+		}
+		if reduceTask := m.popRunnableReduceTask(); reduceTask != nil {
+			reply.Reduce = reduceTask
+			log.Printf("Assigned reduce task %v to worker\n", reduceTask.Id)
+			return nil
+		}
+
+		// Not done but no runnable task.
+		// We are either waiting for all map tasks to finish before starting the reduce phase
+		// or waiting for dispatched reduce tasks to finish.
+		// In either case, we wait until we are clear what to do.
+		m.hasTask.Wait()
 	}
-
-	if len(m.runnableReduceTaskQueue) > 0 {
-		// reduce task available, give reduce task
-		task := m.reduceTasks[m.runnableReduceTaskQueue[0]]
-		m.runnableReduceTaskQueue = m.runnableReduceTaskQueue[1:]
-		reply.Reduce = task
-		log.Printf("Assigned reduce task %v to worker\n", task.Id)
-		return nil
-	}
-
-	// no runnable tasks, either we have finished, or we are waiting for map tasks to finish
-
-	// if all tasks are done, tell all workers to terminate
-	if m.done() {
-		return nil
-	}
-
-	// not done but no runnable task, sleep and wait
-	// TODO: sleep and wait cond var
-
-	// TODO: anticipate worker failure
-
-	return nil
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -191,6 +206,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		completedMapTasks:    make(map[int]struct{}),
 		completedReduceTasks: make(map[int]struct{}),
 	}
+	m.hasTask = sync.NewCond(&m.Mutex)
 
 	m.server()
 	return &m
