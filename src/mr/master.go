@@ -9,42 +9,29 @@ import (
 	"sync"
 )
 
-type TaskStatus int
-
-const (
-	TaskStatusIdle TaskStatus = iota
-	TaskStatusInProgress
-	TaskStatusCompleted
-)
-
-type TaskInfo struct {
-	Id     int
-	Status TaskStatus
-}
-
 type MapTask struct {
-	TaskInfo
+	Id        int
 	InputFile string
 	NReduce   int
 }
 
 func NewMapTask(id int, inputFile string, nReduce int) *MapTask {
 	return &MapTask{
-		TaskInfo:  TaskInfo{Id: id, Status: TaskStatusIdle},
+		Id:        id,
 		InputFile: inputFile,
 		NReduce:   nReduce,
 	}
 }
 
 type ReduceTask struct {
-	TaskInfo
+	Id   int
 	NMap int
 }
 
 func NewReduceTask(id int, nMap int) *ReduceTask {
 	return &ReduceTask{
-		TaskInfo: TaskInfo{Id: id, Status: TaskStatusIdle},
-		NMap:     nMap,
+		Id:   id,
+		NMap: nMap,
 	}
 }
 
@@ -52,8 +39,11 @@ type Master struct {
 	mapTasks    []*MapTask
 	reduceTasks []*ReduceTask
 
-	mapTasksRemaining    int
-	reduceTasksRemaining int
+	runnableMapTaskQueue    []int
+	runnableReduceTaskQueue []int
+
+	completedMapTasks    map[int]struct{}
+	completedReduceTasks map[int]struct{}
 
 	sync.Mutex
 }
@@ -61,29 +51,31 @@ type Master struct {
 func (m *Master) processCompletedTask(id int, taskType TaskType) {
 	if taskType == TaskTypeMap {
 		log.Printf("Worker reported map task %v complete\n", id)
-		task := m.mapTasks[id]
-		switch task.Status {
-		case TaskStatusIdle:
-			panic("cannot go from idle to completed")
-		case TaskStatusInProgress:
-			log.Printf("Map task %v completed normally\n", id)
-			task.Status = TaskStatusCompleted
-			m.mapTasksRemaining--
-		case TaskStatusCompleted:
+
+		if _, alreadyCompleted := m.completedMapTasks[id]; alreadyCompleted {
 			log.Printf("Map task %v already completed. Re-execution?\n", id)
+		} else {
+			m.completedMapTasks[id] = struct{}{}
+			log.Printf("Map task %v completed normally\n", id)
+		}
+
+		if len(m.completedMapTasks) == len(m.mapTasks) {
+			log.Printf("===============================================\n")
+			log.Printf("All map tasks completed, can start reduce phase\n")
+			log.Printf("===============================================\n")
+
+			for i, _ := range m.reduceTasks {
+				m.runnableReduceTaskQueue = append(m.runnableReduceTaskQueue, i)
+			}
 		}
 	} else if taskType == TaskTypeReduce {
 		log.Printf("Worker reported reduce task %v complete\n", id)
-		task := m.reduceTasks[id]
-		switch task.Status {
-		case TaskStatusIdle:
-			panic("cannot go from idle to completed")
-		case TaskStatusInProgress:
-			log.Printf("Reduce task %v completed normally\n", id)
-			task.Status = TaskStatusCompleted
-			m.reduceTasksRemaining--
-		case TaskStatusCompleted:
+
+		if _, alreadyCompleted := m.completedReduceTasks[id]; alreadyCompleted {
 			log.Printf("Reduce task %v already completed. Re-execution?\n", id)
+		} else {
+			m.completedReduceTasks[id] = struct{}{}
+			log.Printf("Reduce task %v completed normally\n", id)
 		}
 	} else {
 		panic("received invalid task type from worker")
@@ -101,29 +93,35 @@ func (m *Master) RequestForTask(completedTask *RequestForTaskArgs, reply *Reques
 
 	// Give the worker another task
 
-	// First try looking for a map task
-	for _, mapTask := range m.mapTasks {
-		if mapTask.Status == TaskStatusIdle {
-			mapTask.Status = TaskStatusInProgress
-			reply.Map = mapTask
-			log.Printf("Assigned map task %v to worker\n", mapTask.Id)
-			return nil
-		}
+	if len(m.runnableMapTaskQueue) > 0 {
+		// map task available, give map task
+		task := m.mapTasks[m.runnableMapTaskQueue[0]]
+		m.runnableMapTaskQueue = m.runnableMapTaskQueue[1:]
+		reply.Map = task
+		log.Printf("Assigned map task %v to worker\n", task.Id)
+		return nil
 	}
 
-	// If no more map tasks, try reduce task
-	// TODO: need to determine whether we can start to give out reduce tasks
-	//for _, reduceTask := range m.reduceTasks {
-	//	if reduceTask.Status == TaskStatusIdle {
-	//		reduceTask.Status = TaskStatusInProgress
-	//		reply.Reduce = reduceTask
-	//		return nil
-	//	}
-	//}
+	if len(m.runnableReduceTaskQueue) > 0 {
+		// reduce task available, give reduce task
+		task := m.reduceTasks[m.runnableReduceTaskQueue[0]]
+		m.runnableReduceTaskQueue = m.runnableReduceTaskQueue[1:]
+		reply.Reduce = task
+		log.Printf("Assigned reduce task %v to worker\n", task.Id)
+		return nil
+	}
+
+	// no runnable tasks, either we have finished, or we are waiting for map tasks to finish
+
+	// if all tasks are done, tell all workers to terminate
+	if m.done() {
+		return nil
+	}
+
+	// not done but no runnable task, sleep and wait
+	// TODO: sleep and wait cond var
 
 	// TODO: anticipate worker failure
-
-	// TODO: handle all tasks completed
 
 	return nil
 }
@@ -146,6 +144,11 @@ func (m *Master) server() {
 	go http.Serve(l, nil)
 }
 
+func (m *Master) done() bool {
+	return len(m.completedMapTasks) == len(m.mapTasks) &&
+		len(m.completedReduceTasks) == len(m.reduceTasks)
+}
+
 //
 // main/mrmaster.go calls Done() periodically to find out
 // if the entire job has finished.
@@ -154,7 +157,7 @@ func (m *Master) Done() bool {
 	m.Lock()
 	defer m.Unlock()
 
-	return m.mapTasksRemaining == 0 && m.reduceTasksRemaining == 0
+	return m.done()
 }
 
 //
@@ -166,8 +169,11 @@ func MakeMaster(files []string, nReduce int) *Master {
 	nMap := len(files)
 
 	mapTasks := make([]*MapTask, 0, nMap)
+	runnableMapTaskQueue := make([]int, 0, nMap)
 	for i, inputFile := range files {
 		mapTasks = append(mapTasks, NewMapTask(i, inputFile, nReduce))
+		// Map tasks are immediately runnable
+		runnableMapTaskQueue = append(runnableMapTaskQueue, i)
 	}
 
 	reduceTasks := make([]*ReduceTask, 0, nReduce)
@@ -176,10 +182,14 @@ func MakeMaster(files []string, nReduce int) *Master {
 	}
 
 	m := Master{
-		mapTasks:             mapTasks,
-		reduceTasks:          reduceTasks,
-		mapTasksRemaining:    nMap,
-		reduceTasksRemaining: nReduce,
+		mapTasks:    mapTasks,
+		reduceTasks: reduceTasks,
+
+		runnableMapTaskQueue:    runnableMapTaskQueue,
+		runnableReduceTaskQueue: make([]int, 0, nReduce),
+
+		completedMapTasks:    make(map[int]struct{}),
+		completedReduceTasks: make(map[int]struct{}),
 	}
 
 	m.server()
