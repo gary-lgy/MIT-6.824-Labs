@@ -267,10 +267,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.lastReceivedHeartbeatOrVoted = time.Now()
+	serverDPrint(rf.me, "AppendEntries", "received AppendEntries RPC from %d term = (%d) my term = (%d)\n",
+		args.LeaderId, args.Term, rf.currentTerm)
 
 	if args.Term > rf.currentTerm {
-		serverDPrint(rf.me, "AppendEntries", "received AppendEntries RPC from %d with higher term (%d) than me (%d)\n",
-			args.LeaderId, args.Term, rf.currentTerm)
+		serverDPrint(rf.me, "AppendEntries", "stale, revert back to follower")
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -472,13 +473,12 @@ func (rf *Raft) sendHeartbeat() {
 			continue
 		}
 		go func(i int) {
-			for !rf.killed() {
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, &args, &reply)
-				if ok {
-					rf.processHeartbeatResponse(i, heartbeatId, &reply)
-					return
-				}
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(i, &args, &reply)
+			if ok {
+				rf.processHeartbeatResponse(i, heartbeatId, &reply)
+				return
+			} else {
 				serverDPrint(rf.me, "AppendEntries", "heartbeat to %d for term %d id = %s failed\n", i, termAsLeader, heartbeatId)
 			}
 		}(i)
