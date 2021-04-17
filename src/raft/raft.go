@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -83,14 +82,20 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Whether this server is a follower, candidate, or leader.
 	state raftServerState
 
-	currentTerm      int
-	votedFor         int
+	// Current term number.
+	currentTerm int
+	// The server this server voted for in the current term.
+	votedFor int
+	// Number of votes this server gathered in the current term.
 	numVotesGathered int
 
-	leaderId               int
-	lastElectionCheckpoint time.Time
+	// Id of the server in the current term.
+	leaderId int
+	// The last time this server received heartbeat from a leader or voted for a candidate.
+	lastReceivedHeartbeatOrVoted time.Time
 }
 
 // return currentTerm and whether this server
@@ -194,7 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		serverDPrint(rf.me, "voted for %d for term %d\n", args.CandidateId, rf.currentTerm)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.lastElectionCheckpoint = time.Now()
+		rf.lastReceivedHeartbeatOrVoted = time.Now()
 	} else {
 		serverDPrint(rf.me, "did not vote for %d for term %d because I've already voted for %d\n", args.CandidateId, rf.currentTerm, rf.votedFor)
 		reply.VoteGranted = false
@@ -261,7 +266,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.lastElectionCheckpoint = time.Now()
+	rf.lastReceivedHeartbeatOrVoted = time.Now()
 
 	if args.Term > rf.currentTerm {
 		serverDPrint(rf.me, "received AppendEntries RPC from %d with higher term (%d) than me (%d)\n",
@@ -334,10 +339,12 @@ func (rf *Raft) killed() bool {
 }
 
 const (
-	MinElectionTimeout   = 800 * time.Millisecond
-	MaxElectionTimeout   = 1600 * time.Millisecond
-	ElectionCheckTimeout = 100 * time.Millisecond
-	HeartbeatTimeout     = 100 * time.Millisecond
+	MinElectionTimeout           = 800 * time.Millisecond
+	MaxElectionTimeout           = 1600 * time.Millisecond
+	// The interval at which a server will check for election timeout.
+	ElectionTimeoutCheckInterval = 100 * time.Millisecond
+	// The interval at which a leader will send heartbeats.
+	HeartbeatInterval = 100 * time.Millisecond
 )
 
 func getRandomTimeout(lowerBound, upperBound time.Duration) time.Duration {
@@ -346,20 +353,20 @@ func getRandomTimeout(lowerBound, upperBound time.Duration) time.Duration {
 	return lowerBound + time.Duration(variance)*time.Millisecond
 }
 
-func (rf *Raft) electionLoop() {
+// Periodically check for election timeout.
+func (rf *Raft) electionTimeoutLoop() {
 	electionTimeout := getRandomTimeout(MinElectionTimeout, MaxElectionTimeout)
 	for {
-		time.Sleep(ElectionCheckTimeout)
+		time.Sleep(ElectionTimeoutCheckInterval)
 
 		if rf.killed() {
 			return
 		}
 
 		rf.Lock()
-		if rf.state != Leader && time.Since(rf.lastElectionCheckpoint) >= electionTimeout {
+		if rf.state != Leader && time.Since(rf.lastReceivedHeartbeatOrVoted) >= electionTimeout {
 			serverDPrint(rf.me, "election timeout after %d milliseconds", electionTimeout.Milliseconds())
 			rf.startElection()
-			rf.lastElectionCheckpoint = time.Now()
 			// Get new randomised election timeout
 			electionTimeout = getRandomTimeout(MinElectionTimeout, MaxElectionTimeout)
 		}
@@ -368,15 +375,15 @@ func (rf *Raft) electionLoop() {
 }
 
 func (rf *Raft) startElection() {
+	rf.state = Candidate
 	rf.currentTerm++
 	rf.leaderId = -1
-	rf.state = Candidate
-
-	serverDPrint(rf.me, "start new election for term %d\n", rf.currentTerm)
-
 	// Vote for self
 	rf.votedFor = rf.me
 	rf.numVotesGathered = 1
+	rf.lastReceivedHeartbeatOrVoted = time.Now()
+
+	serverDPrint(rf.me, "start new election for term %d\n", rf.currentTerm)
 
 	// save a copy in case rf.currentTerm changes by the time we process the replies
 	termForElection := rf.currentTerm
@@ -399,12 +406,12 @@ func (rf *Raft) startElection() {
 	}
 }
 
-func (rf *Raft) processVoteResponse(serverId int, termForElection int, reply *RequestVoteReply) {
+func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
 
-	Assert(reply.Term >= termForElection)
-	Assert(rf.currentTerm >= termForElection)
+	Assert(reply.Term >= requestForVoteTerm)
+	Assert(rf.currentTerm >= requestForVoteTerm)
 
 	// To process a vote, all of the following must be true:
 	// 1. The response's term must be equal to the current term
@@ -412,9 +419,9 @@ func (rf *Raft) processVoteResponse(serverId int, termForElection int, reply *Re
 	// 3. I am still a candidate
 
 	if reply.Term > rf.currentTerm {
-		// reply.Term > rf.currentTerm >= termForElection
+		// reply.Term > rf.currentTerm >= requestForVoteTerm
 		serverDPrint(rf.me, "voter %d has higher term (%d) than me (%d)\n",
-			serverId, reply.Term, termForElection)
+			serverId, reply.Term, requestForVoteTerm)
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -425,21 +432,21 @@ func (rf *Raft) processVoteResponse(serverId int, termForElection int, reply *Re
 		return
 	}
 
-	if termForElection != rf.currentTerm {
-		Assert(termForElection < rf.currentTerm)
+	if requestForVoteTerm != rf.currentTerm {
+		Assert(requestForVoteTerm < rf.currentTerm)
 		serverDPrint(rf.me, "received RequestVote response for term %d election from peer %d, but I'm already at term %d\n",
-			termForElection, serverId, rf.currentTerm)
+			requestForVoteTerm, serverId, rf.currentTerm)
 		return
 	}
-	Assert(reply.Term == termForElection && termForElection == rf.currentTerm)
+	Assert(reply.Term == requestForVoteTerm && requestForVoteTerm == rf.currentTerm)
 
 	if rf.state != Candidate {
 		serverDPrint(rf.me, "received RequestVote response for term %d from peer %d, but I'm a %v now\n",
-			termForElection, serverId, rf.state)
+			requestForVoteTerm, serverId, rf.state)
 		return
 	}
 
-	serverDPrint(rf.me, "received %v vote from %d for term %d\n", reply.VoteGranted, serverId, termForElection)
+	serverDPrint(rf.me, "received %v vote from %d for term %d\n", reply.VoteGranted, serverId, requestForVoteTerm)
 	if reply.VoteGranted {
 		rf.numVotesGathered++
 		if rf.numVotesGathered >= (len(rf.peers)+1)/2 {
@@ -493,7 +500,7 @@ func (rf *Raft) processHeartbeatResponse(serverId int, heartbeatId string, reply
 
 func (rf *Raft) heartbeatLoop() {
 	for {
-		time.Sleep(HeartbeatTimeout)
+		time.Sleep(HeartbeatInterval)
 
 		if rf.killed() {
 			return
@@ -535,17 +542,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.numVotesGathered = 0
 
 	rf.leaderId = -1
-	rf.lastElectionCheckpoint = time.Now()
+	rf.lastReceivedHeartbeatOrVoted = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.electionLoop()
+	go rf.electionTimeoutLoop()
 	go rf.heartbeatLoop()
 
 	return rf
-}
-
-func serverDPrint(id int, format string, args ...interface{}) {
-	DPrintf(fmt.Sprintf("[%d] %s", id, format), args...)
 }
