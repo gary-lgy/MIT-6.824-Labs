@@ -20,7 +20,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func serverDPrint(id int, source string, format string, args ...interface{}) {
-	DPrintf(fmt.Sprintf("[%d] (%s) %s", id, source, format), args...)
+	DPrintf(fmt.Sprintf("[%d] (%s)\t%s", id, source, format), args...)
 }
 
 func Assert(condition bool) {

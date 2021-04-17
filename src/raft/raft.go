@@ -95,7 +95,7 @@ type Raft struct {
 	// Id of the server in the current term.
 	leaderId int
 	// The last time this server received heartbeat from a leader or voted for a candidate.
-	lastReceivedHeartbeatOrVoted time.Time
+	lastTimeToReceiveHeartbeatOrGrantVote time.Time
 }
 
 // return currentTerm and whether this server
@@ -186,6 +186,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		serverDPrint(rf.me, "RequestVote", "received RequestVote RPC from %d with higher term (%d) than me (%d)\n",
 			args.CandidateId, args.Term, rf.currentTerm)
+		serverDPrint(rf.me, "RequestVote", "stale, convert to follower\n")
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -199,7 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		serverDPrint(rf.me, "RequestVote", "voted for %d for term %d\n", args.CandidateId, rf.currentTerm)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
-		rf.lastReceivedHeartbeatOrVoted = time.Now()
+		rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
 	} else {
 		serverDPrint(rf.me, "RequestVote", "did not vote for %d for term %d because I've already voted for %d\n", args.CandidateId, rf.currentTerm, rf.votedFor)
 		reply.VoteGranted = false
@@ -266,12 +267,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.lastReceivedHeartbeatOrVoted = time.Now()
+	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
 	serverDPrint(rf.me, "AppendEntries", "received AppendEntries RPC from %d term = (%d) my term = (%d)\n",
 		args.LeaderId, args.Term, rf.currentTerm)
 
 	if args.Term > rf.currentTerm {
-		serverDPrint(rf.me, "AppendEntries", "stale, revert back to follower")
+		serverDPrint(rf.me, "AppendEntries", "stale, convert to follower")
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -365,7 +366,7 @@ func (rf *Raft) electionTimeoutLoop() {
 		}
 
 		rf.Lock()
-		if rf.state != Leader && time.Since(rf.lastReceivedHeartbeatOrVoted) >= electionTimeout {
+		if rf.state != Leader && time.Since(rf.lastTimeToReceiveHeartbeatOrGrantVote) >= electionTimeout {
 			serverDPrint(rf.me, "RequestVote", "election timeout after %d milliseconds", electionTimeout.Milliseconds())
 			rf.startElection()
 			// Get new randomised election timeout
@@ -382,7 +383,7 @@ func (rf *Raft) startElection() {
 	// Vote for self
 	rf.votedFor = rf.me
 	rf.numVotesGathered = 1
-	rf.lastReceivedHeartbeatOrVoted = time.Now()
+	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
 
 	serverDPrint(rf.me, "RequestVote", "start new election for term %d\n", rf.currentTerm)
 
@@ -441,6 +442,7 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 		// reply.Term > rf.currentTerm >= requestForVoteTerm
 		serverDPrint(rf.me, "RequestVote", "voter %d has higher term (%d) than me (%d)\n",
 			serverId, reply.Term, requestForVoteTerm)
+		serverDPrint(rf.me, "RequestVote", "stale, convert to follower\n")
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -510,6 +512,7 @@ func (rf *Raft) processHeartbeatResponse(serverId int, heartbeatId string, reply
 	if reply.Term > rf.currentTerm {
 		serverDPrint(rf.me, "AppendEntries", "received AppendEntries response id = %s from peer %d with higher term (%d) than me (%d)\n",
 			heartbeatId, serverId, reply.Term, rf.currentTerm)
+		serverDPrint(rf.me, "AppendEntries", "stale, convert to follower")
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.state = Follower
@@ -560,7 +563,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.numVotesGathered = 0
 
 	rf.leaderId = -1
-	rf.lastReceivedHeartbeatOrVoted = time.Now()
+	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
