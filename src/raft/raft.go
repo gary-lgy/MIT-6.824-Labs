@@ -394,14 +394,32 @@ func (rf *Raft) startElection() {
 			continue
 		}
 		go func(i int) {
-			for !rf.killed() {
+			for {
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
 					rf.processVoteResponse(i, termForElection, &reply)
 					return
 				}
+
 				serverDPrint(rf.me, "RequestVote", "RequestVote RPC to %d for term %d failed\n", i, termForElection)
+				// Check if we need to retry
+
+				// If already killed, don't retry
+				if rf.killed() {
+					return
+				}
+
+				// If no longer anticipating votes, don't retry
+				rf.Lock()
+				shouldRetry := rf.currentTerm == termForElection && rf.state == Candidate
+				rf.Unlock()
+
+				if !shouldRetry {
+					return
+				} else {
+					serverDPrint(rf.me, "RequestVote", "retry RequestVote to %d for term %d\n", i, termForElection)
+				}
 			}
 		}(i)
 	}
