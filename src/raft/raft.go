@@ -176,7 +176,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.Unlock()
 
 	if args.Term < rf.currentTerm {
-		serverDPrint(rf.me, "rejected RequestVote RPC from %d with lower term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "RequestVote", "rejected RequestVote RPC from %d with lower term (%d) than me (%d)\n",
 			args.CandidateId, args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -184,7 +184,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if args.Term > rf.currentTerm {
-		serverDPrint(rf.me, "received RequestVote RPC from %d with higher term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "RequestVote", "received RequestVote RPC from %d with higher term (%d) than me (%d)\n",
 			args.CandidateId, args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -196,12 +196,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// (2B): Check for up-to-date ness
 
 	if rf.votedFor < 0 || args.CandidateId == rf.votedFor {
-		serverDPrint(rf.me, "voted for %d for term %d\n", args.CandidateId, rf.currentTerm)
+		serverDPrint(rf.me, "RequestVote", "voted for %d for term %d\n", args.CandidateId, rf.currentTerm)
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.lastReceivedHeartbeatOrVoted = time.Now()
 	} else {
-		serverDPrint(rf.me, "did not vote for %d for term %d because I've already voted for %d\n", args.CandidateId, rf.currentTerm, rf.votedFor)
+		serverDPrint(rf.me, "RequestVote", "did not vote for %d for term %d because I've already voted for %d\n", args.CandidateId, rf.currentTerm, rf.votedFor)
 		reply.VoteGranted = false
 	}
 }
@@ -259,7 +259,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.Unlock()
 
 	if args.Term < rf.currentTerm {
-		serverDPrint(rf.me, "rejected AppendEntries RPC from %d with lower term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "AppendEntries", "rejected AppendEntries RPC from %d with lower term (%d) than me (%d)\n",
 			args.LeaderId, args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -269,7 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastReceivedHeartbeatOrVoted = time.Now()
 
 	if args.Term > rf.currentTerm {
-		serverDPrint(rf.me, "received AppendEntries RPC from %d with higher term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "AppendEntries", "received AppendEntries RPC from %d with higher term (%d) than me (%d)\n",
 			args.LeaderId, args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -277,7 +277,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.leaderId != args.LeaderId {
-		serverDPrint(rf.me, "recognize server %d as new leader for term %d\n", args.LeaderId, args.Term)
+		serverDPrint(rf.me, "AppendEntries", "recognize server %d as new leader for term %d\n", args.LeaderId, args.Term)
 		rf.state = Follower
 		rf.leaderId = args.LeaderId
 	}
@@ -339,8 +339,8 @@ func (rf *Raft) killed() bool {
 }
 
 const (
-	MinElectionTimeout           = 800 * time.Millisecond
-	MaxElectionTimeout           = 1600 * time.Millisecond
+	MinElectionTimeout = 800 * time.Millisecond
+	MaxElectionTimeout = 1600 * time.Millisecond
 	// The interval at which a server will check for election timeout.
 	ElectionTimeoutCheckInterval = 100 * time.Millisecond
 	// The interval at which a leader will send heartbeats.
@@ -365,7 +365,7 @@ func (rf *Raft) electionTimeoutLoop() {
 
 		rf.Lock()
 		if rf.state != Leader && time.Since(rf.lastReceivedHeartbeatOrVoted) >= electionTimeout {
-			serverDPrint(rf.me, "election timeout after %d milliseconds", electionTimeout.Milliseconds())
+			serverDPrint(rf.me, "RequestVote", "election timeout after %d milliseconds", electionTimeout.Milliseconds())
 			rf.startElection()
 			// Get new randomised election timeout
 			electionTimeout = getRandomTimeout(MinElectionTimeout, MaxElectionTimeout)
@@ -383,7 +383,7 @@ func (rf *Raft) startElection() {
 	rf.numVotesGathered = 1
 	rf.lastReceivedHeartbeatOrVoted = time.Now()
 
-	serverDPrint(rf.me, "start new election for term %d\n", rf.currentTerm)
+	serverDPrint(rf.me, "RequestVote", "start new election for term %d\n", rf.currentTerm)
 
 	// save a copy in case rf.currentTerm changes by the time we process the replies
 	termForElection := rf.currentTerm
@@ -400,7 +400,7 @@ func (rf *Raft) startElection() {
 					rf.processVoteResponse(i, termForElection, &reply)
 					return
 				}
-				serverDPrint(rf.me, "RequestVote RPC to %d for term %d failed\n", i, termForElection)
+				serverDPrint(rf.me, "RequestVote", "RequestVote RPC to %d for term %d failed\n", i, termForElection)
 			}
 		}(i)
 	}
@@ -420,37 +420,37 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 
 	if reply.Term > rf.currentTerm {
 		// reply.Term > rf.currentTerm >= requestForVoteTerm
-		serverDPrint(rf.me, "voter %d has higher term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "RequestVote", "voter %d has higher term (%d) than me (%d)\n",
 			serverId, reply.Term, requestForVoteTerm)
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 		rf.state = Follower
 		return
 	} else if reply.Term < rf.currentTerm {
-		serverDPrint(rf.me, "received RequestVote response from peer %d with term %d, but I'm already at term %d\n",
+		serverDPrint(rf.me, "RequestVote", "received RequestVote response from peer %d with term %d, but I'm already at term %d\n",
 			serverId, reply.Term, rf.currentTerm)
 		return
 	}
 
 	if requestForVoteTerm != rf.currentTerm {
 		Assert(requestForVoteTerm < rf.currentTerm)
-		serverDPrint(rf.me, "received RequestVote response for term %d election from peer %d, but I'm already at term %d\n",
+		serverDPrint(rf.me, "RequestVote", "received RequestVote response for term %d election from peer %d, but I'm already at term %d\n",
 			requestForVoteTerm, serverId, rf.currentTerm)
 		return
 	}
 	Assert(reply.Term == requestForVoteTerm && requestForVoteTerm == rf.currentTerm)
 
 	if rf.state != Candidate {
-		serverDPrint(rf.me, "received RequestVote response for term %d from peer %d, but I'm a %v now\n",
+		serverDPrint(rf.me, "RequestVote", "received RequestVote response for term %d from peer %d, but I'm a %v now\n",
 			requestForVoteTerm, serverId, rf.state)
 		return
 	}
 
-	serverDPrint(rf.me, "received %v vote from %d for term %d\n", reply.VoteGranted, serverId, requestForVoteTerm)
+	serverDPrint(rf.me, "RequestVote", "received %v vote from %d for term %d\n", reply.VoteGranted, serverId, requestForVoteTerm)
 	if reply.VoteGranted {
 		rf.numVotesGathered++
 		if rf.numVotesGathered >= (len(rf.peers)+1)/2 {
-			serverDPrint(rf.me, "received majority vote (%d) for term %d, become leader\n", rf.numVotesGathered, rf.currentTerm)
+			serverDPrint(rf.me, "RequestVote", "received majority vote (%d) for term %d, become leader\n", rf.numVotesGathered, rf.currentTerm)
 			rf.state = Leader
 			rf.leaderId = rf.me
 			rf.sendHeartbeat()
@@ -464,7 +464,7 @@ func (rf *Raft) sendHeartbeat() {
 	heartbeatId := randstring(4)
 
 	termAsLeader := rf.currentTerm
-	serverDPrint(rf.me, "sending heartbeat %s for term %d\n", heartbeatId, termAsLeader)
+	serverDPrint(rf.me, "AppendEntries", "sending heartbeat %s for term %d\n", heartbeatId, termAsLeader)
 
 	args := AppendEntriesArgs{Term: termAsLeader, LeaderId: rf.me}
 	for i := range rf.peers {
@@ -479,7 +479,7 @@ func (rf *Raft) sendHeartbeat() {
 					rf.processHeartbeatResponse(i, heartbeatId, &reply)
 					return
 				}
-				serverDPrint(rf.me, "AppendEntries to %d for term %d id = %s failed\n", i, termAsLeader, heartbeatId)
+				serverDPrint(rf.me, "AppendEntries", "heartbeat to %d for term %d id = %s failed\n", i, termAsLeader, heartbeatId)
 			}
 		}(i)
 	}
@@ -490,7 +490,7 @@ func (rf *Raft) processHeartbeatResponse(serverId int, heartbeatId string, reply
 	defer rf.Unlock()
 
 	if reply.Term > rf.currentTerm {
-		serverDPrint(rf.me, "received AppendEntries response id = %s from peer %d with higher term (%d) than me (%d)\n",
+		serverDPrint(rf.me, "AppendEntries", "received AppendEntries response id = %s from peer %d with higher term (%d) than me (%d)\n",
 			heartbeatId, serverId, reply.Term, rf.currentTerm)
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1

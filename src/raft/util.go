@@ -5,6 +5,10 @@ import (
 	"log"
 )
 
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+}
+
 // Debugging
 const Debug = 1
 
@@ -15,8 +19,8 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-func serverDPrint(id int, format string, args ...interface{}) {
-	DPrintf(fmt.Sprintf("[%d] %s", id, format), args...)
+func serverDPrint(id int, source string, format string, args ...interface{}) {
+	DPrintf(fmt.Sprintf("[%d] (%s) %s", id, source, format), args...)
 }
 
 func Assert(condition bool) {
