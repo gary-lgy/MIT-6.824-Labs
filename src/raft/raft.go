@@ -72,29 +72,61 @@ func (s raftServerState) String() string {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	sync.Mutex                     // Lock to protect shared access to this peer's state
-	peers      []*labrpc.ClientEnd // RPC end points of all peers
-	persister  *Persister          // Object to hold this peer's persisted state
-	me         int                 // this peer's index into peers[]
-	dead       int32               // set by Kill()
+	// Lock to protect shared access to this peer's state
+	sync.Mutex
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	// Whether this server is a follower, candidate, or leader.
-	state raftServerState
+	// ------------ Constants -----------------
+
+	// RPC end points of all peers
+	peers []*labrpc.ClientEnd
+	// Object to hold this peer's persisted state
+	persister *Persister
+	// This peer's index into peers[]
+	me int
+
+	// ------------ Misc -----------------
+
+	// set by Kill()
+	dead int32
+
+	// -------------- Persistent state ----------------
 
 	// Current term number.
 	currentTerm int
 	// The server this server voted for in the current term.
 	votedFor int
-	// Number of votes this server gathered in the current term.
-	numVotesGathered int
+	// Log entries
+	log []interface{}
+
+	// -------------- Volatile state ----------------
+
+	// Whether this server is a follower, candidate, or leader.
+	state raftServerState
+	// Index of highest log entry known to be committed
+	commitIndex int
+	// index of highest log entry applied to state machine
+	lastApplied int
 
 	// Id of the server in the current term.
 	leaderId int
+
+	// Indices of the next log entry to be sent to each server.
+	// Only valid when the server is a leader.
+	nextIndex []int
+	// Indices of highest log entry known to be replicated on each server.
+	// Only valid when the server is a leader.
+	matchIndex []int
+
+	// Number of votes this server gathered in the current term.
+	// Only valid when the server is a candidate.
+	numVotesGathered int
+
 	// The last time this server received heartbeat from a leader or voted for a candidate.
+	// Only valid when the server is not a leader.
 	lastTimeToReceiveHeartbeatOrGrantVote time.Time
 }
 
@@ -145,6 +177,11 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+func (rf *Raft) convertToFollower() {
+	rf.state = Follower
+	rf.votedFor = -1
+}
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -187,14 +224,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		serverDPrint(rf.me, "RequestVote", "received RequestVote RPC from %d with higher term (%d) than me (%d)\n",
 			args.CandidateId, args.Term, rf.currentTerm)
 		serverDPrint(rf.me, "RequestVote", "stale, convert to follower\n")
+		rf.convertToFollower()
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.state = Follower
 	}
 
 	reply.Term = rf.currentTerm
 
-	// (2B): Check for up-to-date ness
+	// TODO: (2B): Check for up-to-date ness
 
 	if rf.votedFor < 0 || args.CandidateId == rf.votedFor {
 		serverDPrint(rf.me, "RequestVote", "voted for %d for term %d\n", args.CandidateId, rf.currentTerm)
@@ -273,18 +309,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Term > rf.currentTerm {
 		serverDPrint(rf.me, "AppendEntries", "stale, convert to follower")
+		rf.convertToFollower()
 		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.state = Follower
 	}
 
 	if rf.leaderId != args.LeaderId {
 		serverDPrint(rf.me, "AppendEntries", "recognize server %d as new leader for term %d\n", args.LeaderId, args.Term)
-		rf.state = Follower
+		rf.convertToFollower()
 		rf.leaderId = args.LeaderId
 	}
 
-	// Process log entries
+	// TODO: Process log entries
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -376,7 +411,7 @@ func (rf *Raft) electionTimeoutLoop() {
 	}
 }
 
-func (rf *Raft) startElection() {
+func (rf *Raft) convertToCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.leaderId = -1
@@ -384,6 +419,10 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.numVotesGathered = 1
 	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
+}
+
+func (rf *Raft) startElection() {
+	rf.convertToCandidate()
 
 	serverDPrint(rf.me, "RequestVote", "start new election for term %d\n", rf.currentTerm)
 
@@ -443,9 +482,8 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 		serverDPrint(rf.me, "RequestVote", "voter %d has higher term (%d) than me (%d)\n",
 			serverId, reply.Term, requestForVoteTerm)
 		serverDPrint(rf.me, "RequestVote", "stale, convert to follower\n")
+		rf.convertToFollower()
 		rf.currentTerm = reply.Term
-		rf.votedFor = -1
-		rf.state = Follower
 		return
 	} else if reply.Term < rf.currentTerm {
 		serverDPrint(rf.me, "RequestVote", "received RequestVote response from peer %d with term %d, but I'm already at term %d\n",
@@ -470,12 +508,24 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 	serverDPrint(rf.me, "RequestVote", "received %v vote from %d for term %d\n", reply.VoteGranted, serverId, requestForVoteTerm)
 	if reply.VoteGranted {
 		rf.numVotesGathered++
-		if rf.numVotesGathered >= (len(rf.peers)+1)/2 {
+		if rf.gotMajorityVote() {
 			serverDPrint(rf.me, "RequestVote", "received majority vote (%d) for term %d, become leader\n", rf.numVotesGathered, rf.currentTerm)
-			rf.state = Leader
-			rf.leaderId = rf.me
+			rf.convertToLeader()
 			rf.sendHeartbeat()
 		}
+	}
+}
+
+func (rf *Raft) gotMajorityVote() bool {
+	return rf.numVotesGathered >= (len(rf.peers)+1)/2
+}
+
+func (rf *Raft) convertToLeader() {
+	rf.state = Leader
+	rf.leaderId = rf.me
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
 	}
 }
 
@@ -556,13 +606,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
-	rf.state = Follower
-
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.numVotesGathered = 0
+	rf.log = make([]interface{}, 0)
+
+	rf.state = Follower
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.leaderId = -1
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.numVotesGathered = 0
 	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
 
 	// initialize from state persisted before a crash
