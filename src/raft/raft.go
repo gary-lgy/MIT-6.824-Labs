@@ -394,6 +394,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3. If an existing entry conflicts with a new one (same index
 	// but different terms), delete the existing entry and all that
 	// follow it (§5.3)
+	numMatchingEntries := 0
 	for i, newEntry := range args.Entries {
 		entryIndex := args.PrevLogIndex + i + 1
 		if entryIndex > len(rf.log) {
@@ -405,6 +406,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			serverDPrint(rf.me, rf.state, "AppendEntries",
 				"new entry term = %d already exists in log\n",
 				newEntry.Term)
+			numMatchingEntries++
 			continue
 		}
 
@@ -416,7 +418,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 4. Append any new entries not already in the log
-	numMatchingEntries := len(rf.log) - args.PrevLogIndex
 	Assert(numMatchingEntries >= 0)
 	Assert(numMatchingEntries <= len(args.Entries))
 	entriesToAppend := args.Entries[numMatchingEntries:]
