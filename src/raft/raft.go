@@ -359,6 +359,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// Term of the conflicting entry in the receiver's log
+	ConflictingEntryTerm int
+	// The first index the receiver stores for ConflictingEntryTerm
+	ConflictingTermFirstIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -384,6 +388,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
+
 	needPersistState := false
 	defer func() {
 		if needPersistState {
@@ -404,7 +409,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderId, args.Term)
 		rf.convertToFollower()
 		rf.leaderId = args.LeaderId
-		// TODO: need to persist here?
 		needPersistState = true
 	}
 
@@ -414,14 +418,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
-	if args.PrevLogIndex > 0 &&
-		(args.PrevLogIndex > len(rf.log) ||
-			rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		serverDPrint(rf.me, rf.state, "AppendEntries",
-			"reject because prevLogEntry index = %d term = %d does not exist in my log\n",
-			args.PrevLogIndex, args.PrevLogTerm)
-		reply.Success = false
-		return
+	// Using fast backup optimization pages 7-8
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex > len(rf.log) {
+			serverDPrint(rf.me, rf.state, "AppendEntries",
+				"reject because prevLogEntry index = %d term = %d does not exist in my log\n",
+				args.PrevLogIndex, args.PrevLogTerm)
+			// Fast backup case 3: the follower does not have prevLogEntry at all.
+			// Send the next index the follower expects.
+			reply.Success = false
+			reply.ConflictingEntryTerm = -1
+			reply.ConflictingTermFirstIndex = len(rf.log) + 1
+			return
+		}
+
+		prevLogEntry := rf.log[args.PrevLogIndex-1]
+		if prevLogEntry.Term != args.PrevLogTerm {
+			reply.Success = false
+
+			// Fast backup case 1 and 2: The follower has prevLogEntry, but the term does not match with leader's.
+			// Send the conflicting term and index of the first entry in the conflicting term.
+			conflictingEntryTerm := prevLogEntry.Term
+			conflictingTermFirstIndex := binarySearchLogEntry(
+				1,
+				args.PrevLogIndex,
+				rf.log,
+				true,
+				func(entry *LogEntry) bool {
+					return entry.Term == conflictingEntryTerm
+				})
+			Assert(conflictingTermFirstIndex > 0)
+			Assert(conflictingTermFirstIndex <= args.PrevLogIndex)
+			Assert(rf.log[conflictingTermFirstIndex-1].Term == conflictingEntryTerm)
+			Assert(conflictingTermFirstIndex == 1 ||
+				rf.log[conflictingTermFirstIndex-2].Term != conflictingEntryTerm)
+			reply.ConflictingEntryTerm = conflictingEntryTerm
+			reply.ConflictingTermFirstIndex = conflictingTermFirstIndex
+
+			serverDPrint(rf.me, rf.state, "AppendEntries",
+				"reject because term of prevLogEntry at index = %d mismatch, leader term = %d my term = %d, first index of conflicting term = %d\n",
+				args.PrevLogIndex, args.PrevLogTerm, prevLogEntry.Term, conflictingTermFirstIndex)
+			return
+		}
 	}
 
 	reply.Success = true
@@ -864,7 +902,10 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 			"request sent in term = %d to peer %d was accepted\n",
 			args.Term, serverId)
 
-		// update nextIndex and matchIndex
+		// Update nextIndex and matchIndex
+
+		// Be careful that messages can be reordered
+		// Don't accidentally violate invariants
 
 		newNextLogIndex := args.PrevLogIndex + len(args.Entries) + 1
 		if rf.nextIndex[serverId] < newNextLogIndex {
@@ -898,9 +939,42 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 		// decrement nextIndex and retry
 		// retry is handled by the next iteration of the AppendEntries loop
 
-		// don't accidentally increment the nextIndex
 		newNextIndex := args.PrevLogIndex
-		if rf.nextIndex[serverId] > newNextIndex {
+		// Fast backup case 3: retry from the entry the follower expects
+		if reply.ConflictingEntryTerm < 0 {
+			newNextIndex = reply.ConflictingTermFirstIndex
+			serverDPrint(rf.me, rf.state, "AppendEntries",
+				"fast backup case 3: follower does not have entry at index = %d, newNextIndex = %d\n",
+				args.PrevLogIndex, newNextIndex)
+		} else if reply.ConflictingEntryTerm > 0 {
+			Assert(reply.ConflictingTermFirstIndex > 0)
+			indexOfLastEntryWithFollowersTerm := binarySearchLogEntry(
+				1,
+				args.PrevLogIndex-1, // to the left of PrevLogIndex (we already know PrevLogIndex does not match)
+				rf.log,
+				false,
+				func(entry *LogEntry) bool {
+					return entry.Term == reply.ConflictingEntryTerm
+				})
+			if indexOfLastEntryWithFollowersTerm < 0 {
+				// Fast backup case 1: leader's log does not have entries of this term
+				// Overwrite the entire term in the follower's log
+				newNextIndex = reply.ConflictingTermFirstIndex
+				serverDPrint(rf.me, rf.state, "AppendEntries",
+					"fast backup case 1: leader does not have entries from conflicting term = %d, newNextIndex = %d\n",
+					reply.ConflictingEntryTerm, newNextIndex)
+			} else {
+				// Fast backup case 2: leader's log has entries of this term
+				// Retry from the right of the last entry of this term
+				newNextIndex = indexOfLastEntryWithFollowersTerm + 1
+				serverDPrint(rf.me, rf.state, "AppendEntries",
+					"fast backup case 2: leader's last entry from conflicting term = %d is at index %d, newNextIndex = %d\n",
+					reply.ConflictingEntryTerm, indexOfLastEntryWithFollowersTerm, newNextIndex)
+			}
+		}
+		Assert(newNextIndex <= args.PrevLogIndex)
+
+		if newNextIndex < rf.nextIndex[serverId] {
 			serverDPrint(rf.me, rf.state, "AppendEntries",
 				"update nextIndex for follower %d from %d to %d\n",
 				serverId, rf.nextIndex[serverId], newNextIndex)

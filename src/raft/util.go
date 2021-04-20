@@ -79,3 +79,45 @@ func Assert(condition bool) {
 		panic("assertion failed")
 	}
 }
+
+// Takes in inclusive, 1-based search bounds.
+// If a matching entry is found, return the 1-based index of the entry.
+// Otherwise, return a negative number.
+func binarySearchLogEntry(
+	left, right int,
+	log []*LogEntry,
+	wantFirstEntry bool,
+	matchFunc func(*LogEntry) bool,
+) int {
+	Assert(left >= 1)
+	Assert(right <= len(log))
+	Assert(left <= right)
+
+	for left < right {
+		mid := left + (right-left)/2
+		if !wantFirstEntry {
+			// If we're looking for the last entry, use a right-biased middle point to guarantee progress
+			mid = left + (right-left+1)/2
+		}
+		if matchFunc(log[mid-1]) {
+			if wantFirstEntry {
+				right = mid
+			} else {
+				left = mid
+			}
+		} else {
+			if wantFirstEntry {
+				left = mid + 1
+			} else {
+				right = mid - 1
+			}
+		}
+	}
+
+	Assert(left == right)
+	if matchFunc(log[left-1]) {
+		return left
+	} else {
+		return -left
+	}
+}
