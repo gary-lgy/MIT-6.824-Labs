@@ -19,7 +19,6 @@ package raft
 
 import (
 	"bytes"
-	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -305,14 +304,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	needPersistState = true
 }
 
-func isMoreUpToDate(lastEntryTerm1, logLength1, lastEntryTerm2, logLength2 int) bool {
-	if lastEntryTerm1 != lastEntryTerm2 {
-		return lastEntryTerm1 > lastEntryTerm2
-	} else {
-		return logLength1 > logLength2
-	}
-}
-
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -447,10 +438,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				func(entry *LogEntry) bool {
 					return entry.Term == conflictingEntryTerm
 				})
-			Assert(conflictingTermFirstIndex > 0)
-			Assert(conflictingTermFirstIndex <= args.PrevLogIndex)
-			Assert(rf.log[conflictingTermFirstIndex-1].Term == conflictingEntryTerm)
-			Assert(conflictingTermFirstIndex == 1 ||
+			assert(conflictingTermFirstIndex > 0)
+			assert(conflictingTermFirstIndex <= args.PrevLogIndex)
+			assert(rf.log[conflictingTermFirstIndex-1].Term == conflictingEntryTerm)
+			assert(conflictingTermFirstIndex == 1 ||
 				rf.log[conflictingTermFirstIndex-2].Term != conflictingEntryTerm)
 			reply.ConflictingEntryTerm = conflictingEntryTerm
 			reply.ConflictingTermFirstIndex = conflictingTermFirstIndex
@@ -492,8 +483,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 4. Append any new entries not already in the log
-	Assert(numMatchingEntries >= 0)
-	Assert(numMatchingEntries <= len(args.Entries))
+	assert(numMatchingEntries >= 0)
+	assert(numMatchingEntries <= len(args.Entries))
 	entriesToAppend := args.Entries[numMatchingEntries:]
 	serverDPrint(rf.me, rf.state, "AppendEntries",
 		"appending %d new entries\n",
@@ -598,12 +589,6 @@ const (
 	HeartbeatInterval = 100 * time.Millisecond
 )
 
-func getRandomTimeout(lowerBound, upperBound time.Duration) time.Duration {
-	timeRange := upperBound - lowerBound
-	variance := rand.Int63n(timeRange.Milliseconds())
-	return lowerBound + time.Duration(variance)*time.Millisecond
-}
-
 // Periodically check for election timeout.
 func (rf *Raft) electionTimeoutLoop() {
 	electionTimeout := getRandomTimeout(MinElectionTimeout, MaxElectionTimeout)
@@ -704,8 +689,8 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 	rf.Lock()
 	defer rf.Unlock()
 
-	Assert(reply.Term >= requestForVoteTerm)
-	Assert(rf.currentTerm >= requestForVoteTerm)
+	assert(reply.Term >= requestForVoteTerm)
+	assert(rf.currentTerm >= requestForVoteTerm)
 
 	serverDPrint(rf.me, rf.state, "RequestVote",
 		"received RequestVote response from %d, reply = %+v, my state = %+v\n",
@@ -740,13 +725,13 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 	}
 
 	if requestForVoteTerm != rf.currentTerm {
-		Assert(requestForVoteTerm < rf.currentTerm)
+		assert(requestForVoteTerm < rf.currentTerm)
 		serverDPrint(rf.me, rf.state, "RequestVote",
 			"reject response because I'm already at term %d\n",
 			rf.currentTerm)
 		return
 	}
-	Assert(reply.Term == requestForVoteTerm && requestForVoteTerm == rf.currentTerm)
+	assert(reply.Term == requestForVoteTerm && requestForVoteTerm == rf.currentTerm)
 
 	if rf.state != Candidate {
 		serverDPrint(rf.me, rf.state, "RequestVote",
@@ -769,14 +754,6 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 	}
 }
 
-func majority(totalNum int) int {
-	return (totalNum)/2 + 1
-}
-
-func isMajority(num int, totalNum int) bool {
-	return num >= majority(totalNum)
-}
-
 func (rf *Raft) convertToLeader() {
 	rf.state = Leader
 	rf.leaderId = rf.me
@@ -796,8 +773,8 @@ func (rf *Raft) convertToLeader() {
 // If there are log entries to send to the follower, send them.
 // Otherwise, send an empty AppendEntries for heartbeat.
 func (rf *Raft) sendAppendEntriesToFollower(peer int) {
-	Assert(peer != rf.me)
-	Assert(rf.state == Leader)
+	assert(peer != rf.me)
+	assert(rf.state == Leader)
 
 	termAsLeader := rf.currentTerm
 
@@ -817,7 +794,7 @@ func (rf *Raft) sendAppendEntriesToFollower(peer int) {
 	if lastLogIndex >= nextLogIndex {
 		entriesToSend := rf.log[nextLogIndex-1:]
 		args.Entries = make([]*LogEntry, len(entriesToSend))
-		Assert(len(args.Entries) == len(entriesToSend))
+		assert(len(args.Entries) == len(entriesToSend))
 		// Make a copy to avoid data race
 		copy(args.Entries, entriesToSend)
 	}
@@ -881,14 +858,14 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 	}
 
 	if args.Term != rf.currentTerm {
-		Assert(args.Term < rf.currentTerm)
+		assert(args.Term < rf.currentTerm)
 		serverDPrint(rf.me, rf.state, "AppendEntries",
 			"reject response because I'm already at term %d\n",
 			rf.currentTerm)
 		return
 	}
 
-	Assert(reply.Term == args.Term && args.Term == rf.currentTerm)
+	assert(reply.Term == args.Term && args.Term == rf.currentTerm)
 
 	if rf.state != Leader {
 		serverDPrint(rf.me, rf.state, "AppendEntries",
@@ -947,7 +924,7 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 				"fast backup case 3: follower does not have entry at index = %d, newNextIndex = %d\n",
 				args.PrevLogIndex, newNextIndex)
 		} else if reply.ConflictingEntryTerm > 0 {
-			Assert(reply.ConflictingTermFirstIndex > 0)
+			assert(reply.ConflictingTermFirstIndex > 0)
 			indexOfLastEntryWithFollowersTerm := binarySearchLogEntry(
 				1,
 				args.PrevLogIndex-1, // to the left of PrevLogIndex (we already know PrevLogIndex does not match)
@@ -972,7 +949,7 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 					reply.ConflictingEntryTerm, indexOfLastEntryWithFollowersTerm, newNextIndex)
 			}
 		}
-		Assert(newNextIndex <= args.PrevLogIndex)
+		assert(newNextIndex <= args.PrevLogIndex)
 
 		if newNextIndex < rf.nextIndex[serverId] {
 			serverDPrint(rf.me, rf.state, "AppendEntries",
@@ -988,14 +965,14 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 }
 
 func (rf *Raft) checkForCommandsToCommit() {
-	Assert(rf.state == Leader)
+	assert(rf.state == Leader)
 
 	// Find what's replicated on a majority
 	// Sort the matchIndex and take the middle
 	// Make a copy so as not to mutate the original copy
 	matchIndexCopy := make([]int, len(rf.matchIndex))
 	copy(matchIndexCopy, rf.matchIndex)
-	Assert(len(matchIndexCopy) == len(rf.matchIndex))
+	assert(len(matchIndexCopy) == len(rf.matchIndex))
 	// The leader has all the logs
 	matchIndexCopy[rf.me] = len(rf.log)
 
