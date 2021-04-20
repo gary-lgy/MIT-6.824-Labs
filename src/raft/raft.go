@@ -18,17 +18,16 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
-
-// import "bytes"
-// import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -155,13 +154,22 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	if err := encoder.Encode(rf.currentTerm); err != nil {
+		panic(err)
+	}
+	if err := encoder.Encode(rf.votedFor); err != nil {
+		panic(err)
+	}
+	if err := encoder.Encode(rf.log); err != nil {
+		panic(err)
+	}
+	data := buffer.Bytes()
+	serverDPrint(rf.me, rf.state, "Persist",
+		"persisting state, currentTerm = %d, votedFor = %d, log length = %d\n",
+		rf.currentTerm, rf.votedFor, len(rf.log))
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -172,18 +180,27 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	serverDPrint(rf.me, rf.state, "Persist", "reading persisted state\n")
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+	var currentTerm int
+	var votedFor int
+	var log []*LogEntry
+	if err := decoder.Decode(&currentTerm); err != nil {
+		panic(err)
+	}
+	if err := decoder.Decode(&votedFor); err != nil {
+		panic(err)
+	}
+	if err := decoder.Decode(&log); err != nil {
+		panic(err)
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
+	serverDPrint(rf.me, rf.state, "Persist",
+		"read persisted state currentTerm = %d, votedFor = %d, log length = %d\n",
+		currentTerm, votedFor, len(log))
 }
 
 func (rf *Raft) convertToFollower() {
@@ -239,6 +256,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	needPersistState := false
+	defer func() {
+		if needPersistState {
+			rf.persist()
+		}
+	}()
+
 	if args.Term > rf.currentTerm {
 		serverDPrint(rf.me, rf.state, "RequestVote",
 			"received RequestVote RPC from %d with higher term (%d) than me (%d)\n",
@@ -246,6 +270,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		serverDPrint(rf.me, rf.state, "RequestVote", "stale, convert to follower\n")
 		rf.convertToFollower()
 		rf.currentTerm = args.Term
+		needPersistState = true
 	}
 
 	reply.Term = rf.currentTerm
@@ -277,6 +302,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
 	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
+	needPersistState = true
 }
 
 func isMoreUpToDate(lastEntryTerm1, logLength1, lastEntryTerm2, logLength2 int) bool {
@@ -358,11 +384,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.lastTimeToReceiveHeartbeatOrGrantVote = time.Now()
+	needPersistState := false
+	defer func() {
+		if needPersistState {
+			rf.persist()
+		}
+	}()
 
 	if args.Term > rf.currentTerm {
 		serverDPrint(rf.me, rf.state, "AppendEntries", "stale, convert to follower")
 		rf.convertToFollower()
 		rf.currentTerm = args.Term
+		needPersistState = true
 	}
 
 	if rf.leaderId != args.LeaderId {
@@ -371,6 +404,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			args.LeaderId, args.Term)
 		rf.convertToFollower()
 		rf.leaderId = args.LeaderId
+		// TODO: need to persist here?
+		needPersistState = true
 	}
 
 	reply.Term = rf.currentTerm
@@ -414,6 +449,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			"conflicting entry found, truncating log, newTerm = %d, existingTerm = %d\n",
 			newEntry.Term, existingEntry.Term)
 		rf.log = rf.log[:entryIndex-1]
+		needPersistState = true
 		break
 	}
 
@@ -425,6 +461,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		"appending %d new entries\n",
 		len(entriesToAppend))
 	rf.log = append(rf.log, entriesToAppend...)
+	if len(entriesToAppend) > 0 {
+		needPersistState = true
+	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
@@ -487,6 +526,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
+	rf.persist()
 	return logIndex, rf.currentTerm, true
 }
 
@@ -561,6 +601,8 @@ func (rf *Raft) convertToCandidate() {
 
 func (rf *Raft) startElection() {
 	rf.convertToCandidate()
+	rf.persist()
+
 	serverDPrint(rf.me, rf.state, "Election",
 		"Start election, my state = %+v\n",
 		stringifyState(rf))
@@ -650,6 +692,7 @@ func (rf *Raft) processVoteResponse(serverId int, requestForVoteTerm int, reply 
 			"stale, convert to follower\n")
 		rf.convertToFollower()
 		rf.currentTerm = reply.Term
+		rf.persist()
 		return
 	} else if reply.Term < rf.currentTerm {
 		serverDPrint(rf.me, rf.state, "RequestVote",
@@ -790,6 +833,7 @@ func (rf *Raft) processAppendEntriesResponse(serverId int, args *AppendEntriesAr
 		serverDPrint(rf.me, rf.state, "AppendEntries", "stale, convert to follower")
 		rf.convertToFollower()
 		rf.currentTerm = reply.Term
+		rf.persist()
 		return
 	} else if reply.Term < rf.currentTerm {
 		serverDPrint(rf.me, rf.state, "AppendEntries",
