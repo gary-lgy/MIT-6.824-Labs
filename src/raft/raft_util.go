@@ -40,7 +40,10 @@ func binarySearchLogEntry(
 ) int {
 	assert(left >= 1)
 	assert(right <= len(log))
-	assert(left <= right)
+
+    if left > right {
+        return -1
+    }
 
 	for left < right {
 		mid := left + (right-left)/2
